@@ -1,0 +1,102 @@
+on: [push]
+
+name: Build and Release
+
+jobs:
+  build-releases:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Get current tag
+        id: current_tag
+        uses: WyriHaximus/github-action-get-previous-tag@v1
+
+
+  build-docker:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform:
+          - linux/arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        if: ${{ matrix.platform != 'linux/amd64' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Acquire Docker image metadata
+        id: metadata
+        uses: docker/metadata-action@v4
+        with:
+          images: bendangelo/sonic
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push by digest
+        uses: docker/build-push-action@v4
+        id: build
+        with:
+          context: .
+          labels: ${{ steps.metadata.outputs.labels }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=bendangelo/sonic,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digests
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digests
+        uses: actions/upload-artifact@v3
+        with:
+          name: docker-digests
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-docker:
+    runs-on: ubuntu-latest
+    needs:
+      - build-docker
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v3
+        with:
+          name: docker-digests
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: bendangelo/sonic
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'bendangelo/sonic@sha256:%s ' *)
